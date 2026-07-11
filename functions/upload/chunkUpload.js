@@ -1,9 +1,10 @@
 /* ======= 客户端分块上传处理 ======= */
 import { createResponse, selectConsistentChannel, getUploadIp, getIPAddress, buildUniqueFileId, endUpload } from './uploadTools';
-import { TelegramAPI } from '../utils/telegramAPI';
-import { DiscordAPI } from '../utils/discordAPI';
+import { TelegramAPI } from '../utils/storage/telegramAPI';
+import { DiscordAPI } from '../utils/storage/discordAPI';
 import { S3Client, CreateMultipartUploadCommand, UploadPartCommand, AbortMultipartUploadCommand } from "@aws-sdk/client-s3";
 import { getDatabase, checkDatabaseConfig } from '../utils/databaseAdapter.js';
+import { fetchPageConfig } from '../utils/sysConfig.js';
 
 // 初始化分块上传
 export async function initializeChunkedUpload(context) {
@@ -29,10 +30,13 @@ export async function initializeChunkedUpload(context) {
 
         // 获取上传IP
         const uploadIp = getUploadIp(request);
-        const ipAddress = await getIPAddress(uploadIp);
+        const ipAddress = await getIPAddress(env, uploadIp, context.securityConfig);
 
         // 获取上传渠道
         const uploadChannel = url.searchParams.get('uploadChannel') || 'telegram';
+        if (uploadChannel === 'webdav') {
+            return createResponse('Error: WebDAV channel does not support chunked uploads. Please use non-chunked upload within your Cloudflare request body limit.', { status: 400 });
+        }
         // 获取指定的渠道名称
         const channelName = url.searchParams.get('channelName') || '';
 
@@ -121,6 +125,9 @@ export async function handleChunkUpload(context) {
 
         // 获取上传渠道
         const uploadChannel = url.searchParams.get('uploadChannel') || sessionInfo.uploadChannel || 'telegram';
+        if (uploadChannel === 'webdav') {
+            return createResponse('Error: WebDAV channel does not support chunked uploads. Please use non-chunked upload within your Cloudflare request body limit.', { status: 400 });
+        }
         // 获取指定的渠道名称
         const channelName = url.searchParams.get('channelName') || sessionInfo.channelName || '';
 
@@ -1246,9 +1253,6 @@ export async function uploadLargeFileToTelegram(context, file, fullId, metadata,
         // 所有分片上传成功，更新metadata
         metadata.Channel = "TelegramNew";
         metadata.ChannelName = tgChannel.name;
-        metadata.TgChatId = tgChatId;
-        metadata.TgBotToken = tgBotToken;
-        metadata.TgProxyUrl = tgChannel.proxyUrl || '';
         metadata.IsChunked = true;
         metadata.TotalChunks = totalChunks;
         metadata.FileSize = (fileSize / 1024 / 1024).toFixed(2);
@@ -1268,8 +1272,17 @@ export async function uploadLargeFileToTelegram(context, file, fullId, metadata,
         // 异步结束上传
         waitUntil(endUpload(context, fullId, metadata));
 
+        // 构建公开访问链接（使用 urlPrefix 配置）
+        const pageConfig = await fetchPageConfig(env);
+        const urlPrefixConfig = pageConfig.config?.find(c => c.id === 'urlPrefix');
+        const urlPrefix = urlPrefixConfig?.value || '';
+        const responseBody = [{ 'src': returnLink }];
+        if (urlPrefix) {
+            responseBody[0].publicUrl = `${urlPrefix.replace(/\/+$/, '')}/${fullId}`;
+        }
+
         return createResponse(
-            JSON.stringify([{ 'src': returnLink }]),
+            JSON.stringify(responseBody),
             {
                 status: 200,
                 headers: {
